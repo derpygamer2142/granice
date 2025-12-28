@@ -29,9 +29,12 @@ struct client_info {
     char request[MAX_REQUEST_SIZE + 1];
     int received;
     struct client_info *next;
+    SSL* ssl;
+    int tls;
 };
 
 static struct client_info* clients = 0;
+SSL_CTX* ctx;
 
 struct client_info* get_client(int socket) {
     struct client_info* ci = clients;
@@ -55,8 +58,10 @@ struct client_info* get_client(int socket) {
     return n;
 }
 
-void drop_client(struct client_info* client) {
+void drop_client(struct client_info* client/*, int handshake_successful*/) {
+    //if (handshake_successful) SSL_shutdown(client->ssl);
     close(client->socket);
+    SSL_free(client->ssl);
 
     struct client_info** p = &clients;
 
@@ -84,11 +89,13 @@ const char* get_client_address(struct client_info* ci) {
     return address_buffer;
 }
 
-fd_set wait_on_clients(int server) {
+fd_set wait_on_clients(int https, int http) {
     fd_set reads;
     FD_ZERO(&reads);
-    FD_SET(server, &reads);
-    int max_socket = server;
+    FD_SET(http,  &reads);
+    FD_SET(https, &reads);
+    int max_socket = http;
+    if (https > max_socket) max_socket = https;
 
     struct client_info* ci = clients;
     while (ci) {
@@ -110,7 +117,8 @@ void send_400(struct client_info* client) {
     const char* text = "HTTP/1.1 400 Bad Request\r\n"
                        "Connection: close\r\n"
                        "Content-Length: 11\r\n\r\nBad Request";
-    send(client->socket, text, strlen(text), 0); // todo: queue this?
+    if (client->tls) SSL_write(client->ssl, text, strlen(text)); // todo: queue this?
+    else send(client->socket, text, strlen(text), 0);
     drop_client(client);
 }
 
@@ -119,7 +127,8 @@ void send_404(struct client_info* client) {
     const char* text = "HTTP/1.1 404 Not Found\r\n"
                        "Connection: close\r\n"
                        "Content-Length: 9\r\n\r\nNot Found";
-    send(client->socket, text, strlen(text), 0); // todo: queue this?
+    if (client->tls) SSL_write(client->ssl, text, strlen(text)); // todo: queue this?
+    else send(client->socket, text, strlen(text), 0);
     drop_client(client);
 }
 
@@ -168,26 +177,47 @@ void serve_resource(struct client_info* client, const char* path) {
     #define BSIZE 1024
     char buffer[BSIZE];
     
-    // this is not a good way to do this
-    sprintf(buffer, "HTTP/1.1 200 OK\r\n");
-    send(client->socket, buffer, strlen(buffer), 0);
+    if (client->tls) {
+        // this is not a good way to do this
+        sprintf(buffer, "HTTP/1.1 200 OK\r\n");
+        SSL_write(client->ssl, buffer, strlen(buffer));
 
-    sprintf(buffer, "Connection: close\r\n");
-    send(client->socket, buffer, strlen(buffer), 0);
-    
-    sprintf(buffer, "Content-Length: %lu\r\n", content_length);
-    send(client->socket, buffer, strlen(buffer), 0);
+        sprintf(buffer, "Connection: close\r\n");
+        SSL_write(client->ssl, buffer, strlen(buffer));
+        
+        sprintf(buffer, "Content-Length: %lu\r\n", content_length);
+        SSL_write(client->ssl, buffer, strlen(buffer));
 
-    sprintf(buffer, "Content-Type: %s\r\n", content_type);
-    send(client->socket, buffer, strlen(buffer), 0);
+        sprintf(buffer, "Content-Type: %s\r\n", content_type);
+        SSL_write(client->ssl, buffer, strlen(buffer));
 
-    sprintf(buffer, "\r\n");
-    send(client->socket, buffer, strlen(buffer), 0);
+        sprintf(buffer, "\r\n");
+        SSL_write(client->ssl, buffer, strlen(buffer));        
+    }
+    else {
+                // this is not a good way to do this
+        sprintf(buffer, "HTTP/1.1 200 OK\r\n");
+        send(client->socket, buffer, strlen(buffer), 0);
+
+        sprintf(buffer, "Connection: close\r\n");
+        send(client->socket, buffer, strlen(buffer), 0);
+        
+        sprintf(buffer, "Content-Length: %lu\r\n", content_length);
+        send(client->socket, buffer, strlen(buffer), 0);
+
+        sprintf(buffer, "Content-Type: %s\r\n", content_type);
+        send(client->socket, buffer, strlen(buffer), 0);
+
+        sprintf(buffer, "\r\n");
+        send(client->socket, buffer, strlen(buffer), 0);
+    }
+
 
     // bad
     int r = fread(buffer, 1, BSIZE, fp);
     while (r) {
-        send(client->socket, buffer, r, 0);
+        if (client->tls) SSL_write(client->ssl, buffer, r);
+        else send(client->socket, buffer, r, 0);
         r = fread(buffer, 1, BSIZE, fp);
     }
 
@@ -226,7 +256,7 @@ int create_socket(const char* host, const char* port) {
 
     printf("Binding socket\n");
     if (bind(socket_listen, bind_address->ai_addr, bind_address->ai_addrlen)) {
-        fprintf(stderr, "bind( failed. (%d)\n", errno);
+        fprintf(stderr, "bind() failed. (%d)\n", errno);
         exit(1);
     }
     freeaddrinfo(bind_address);
@@ -241,26 +271,83 @@ int create_socket(const char* host, const char* port) {
 }
 
 int main() {
-    int server = create_socket(0, "8080");
+
+    SSL_library_init();
+    OpenSSL_add_all_algorithms();
+    SSL_load_error_strings();
+
+    ctx = SSL_CTX_new(TLS_server_method());
+    if (!ctx) {
+        fprintf(stderr, "SSL_CTX_new() failed\n");
+        return 1;
+    }
+    if (!SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM)
+    || !SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM)) {
+        fprintf(stderr, "SSL_CTX_use_certificate_file() failed\n");
+        ERR_print_errors_fp(stderr);
+        return 1;
+    }
+
+    int https_server = create_socket(0, "443");
+    int http_server  = create_socket(0, "80");
 
     while (1) {
         fd_set reads;
-        reads = wait_on_clients(server);
+        reads = wait_on_clients(https_server, http_server);
 
-        if (FD_ISSET(server, &reads)) {
+        if (FD_ISSET(https_server, &reads)) {
+            // handle connections on the https port
             struct client_info* client = get_client(-1);
 
-            client->socket = accept(server,
+            client->socket = accept(https_server,
                 (struct sockaddr*) &(client->address),
                 &client->address_length
             );
 
             if (client->socket < 0) {
                 fprintf(stderr, "accept() failed. (%d)\n", errno);
+                close(https_server);
                 return 1;
             }
 
-            printf("New connection from %s\n", get_client_address(client));
+            client->ssl = SSL_new(ctx);
+            if (!client->ssl) {
+                fprintf(stderr, "SSL_new() failed\n");
+                return 1;
+            }
+            SSL_set_fd(client->ssl, client->socket);
+            if (SSL_accept(client->ssl) <= 0) {
+                fprintf(stderr, "SSL_accept() failed\n");
+                ERR_print_errors_fp(stderr);
+
+
+                drop_client(client);
+            }
+            else {
+                printf("New https connection from %s, using SSL %s\n", get_client_address(client), SSL_get_cipher(client->ssl));
+                client->tls = 1;
+            }
+
+
+        }
+        if (FD_ISSET(http_server, &reads)) {
+            // handle connections on the http port
+            struct client_info* client = get_client(-1);
+            client->tls = 0;
+
+            client->socket = accept(http_server,
+                (struct sockaddr*) &(client->address),
+                &client->address_length
+            );
+
+            if (client->socket < 0) {
+                fprintf(stderr, "accept() failed. (%d)\n", errno);
+                close(http_server);
+                return 1;
+            }
+
+            printf("New http connection from %s\n", get_client_address(client));
+
         }
 
         struct client_info* client = clients;
@@ -274,8 +361,10 @@ int main() {
                     send_400(client); // todo: maybe 500?
                     continue;
                 }
-                int r = recv(client->socket, client->request + client->received, MAX_REQUEST_SIZE-client->received, 0);
 
+                int r;
+                if (client->tls) r = SSL_read(client->ssl, client->request + client->received, MAX_REQUEST_SIZE-client->received);
+                else r = recv(client->socket, client->request + client->received, MAX_REQUEST_SIZE-client->received, 0);
 
                 if (r < 1) {
                     printf("Unexpected disconnect from %s\n", get_client_address(client));
@@ -310,7 +399,9 @@ int main() {
     }
 
     printf("\nClosing socket\n");
-    close(server);
+    close(https_server);
+    close(http_server);
+    SSL_CTX_free(ctx);
     printf("Finished");
     return 0;
 }
