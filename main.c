@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 // openssl stuff
 #include <openssl/crypto.h>
@@ -105,7 +106,7 @@ fd_set wait_on_clients(int https, int http) {
     }
 
     if (select(max_socket+1, &reads, 0, 0, 0) < 0) {
-        fprintf(stderr, "select() failed. (%d)\n", errno);
+        fprintf(stderr, "select() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }
 
@@ -242,7 +243,13 @@ int create_socket(const char* host, const char* port) {
         bind_address->ai_socktype, bind_address->ai_protocol);
     
     if (socket_listen < 0) {
-        fprintf(stderr, "socket() failed. (%d)\n", errno);
+        fprintf(stderr, "socket() failed. %s (%d)\n", strerror(errno), errno);
+        exit(1);
+    }
+
+    int yes = 1;
+    if (setsockopt(socket_listen, SOL_SOCKET, SO_REUSEADDR, (void*)&yes, sizeof(yes)) < 0) {
+        fprintf(stderr, "setsockopt() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }
 
@@ -250,20 +257,20 @@ int create_socket(const char* host, const char* port) {
     // doesn't work on wsl so i can't test it
     /*int option = 0;
     if (setsockopt(socket_listen, IPPROTO_IPV6, IPV6_V6ONLY, (void*)&option, sizeof(option))) {
-        fprintf(stderr, "setsockopt() failed. (%d)\n", errno);
+        fprintf(stderr, "setsockopt() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }*/
 
     printf("Binding socket\n");
     if (bind(socket_listen, bind_address->ai_addr, bind_address->ai_addrlen)) {
-        fprintf(stderr, "bind() failed. (%d)\n", errno);
+        fprintf(stderr, "bind() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }
     freeaddrinfo(bind_address);
 
     printf("Now listening\n");
     if (listen(socket_listen, 10)) {
-        fprintf(stderr, "listen() failed. (%d)\n", errno);
+        fprintf(stderr, "listen() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }
 
@@ -271,6 +278,8 @@ int create_socket(const char* host, const char* port) {
 }
 
 int main() {
+
+    signal(SIGPIPE, SIG_IGN);
 
     SSL_library_init();
     OpenSSL_add_all_algorithms();
@@ -287,6 +296,7 @@ int main() {
         ERR_print_errors_fp(stderr);
         return 1;
     }
+
 
     int https_server = create_socket(0, "443");
     int http_server  = create_socket(0, "80");
@@ -305,7 +315,7 @@ int main() {
             );
 
             if (client->socket < 0) {
-                fprintf(stderr, "accept() failed. (%d)\n", errno);
+                fprintf(stderr, "accept() failed. %s (%d)\n", strerror(errno), errno);
                 close(https_server);
                 return 1;
             }
@@ -341,7 +351,7 @@ int main() {
             );
 
             if (client->socket < 0) {
-                fprintf(stderr, "accept() failed. (%d)\n", errno);
+                fprintf(stderr, "accept() failed. %s (%d)\n", strerror(errno), errno);
                 close(http_server);
                 return 1;
             }
