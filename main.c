@@ -21,7 +21,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#define MAX_REQUEST_SIZE 65535
+#define MAX_REQUEST_SIZE 2048
 
 struct client_info {
     socklen_t address_length;
@@ -155,17 +155,34 @@ const char* get_content_type(const char* path) {
     return "application/octet-stream";
 }
 
-void serve_resource(struct client_info* client, const char* path) {
+void serve_resource(struct client_info* client, char* path) {
     // todo: queue this?
     // cache files
     printf("serve_resource %s %s\n", get_client_address(client), path);
+    int shouldfree = 0;
 
     if (strcmp(path, "/") == 0) path = "/index.html";
-    if (strlen(path) > 100) return send_400(client);
-    if (strstr(path, "..")) return send_404(client);
+    if (strrchr(path, '.') <= strrchr(path, '/')) {
+        char* temppath = malloc(strlen(path) + strlen(".html") + 1);
+        strcpy(temppath, path);
+        strcat(temppath, ".html");
+        printf("Correcting path %s to %s\n", path, temppath);
+        path = temppath;
+        printf("Path: %s\n", path);
+        shouldfree = 1;
+    }
+    if (strlen(path) > 100) {
+        if (shouldfree) free(path);
+        return send_400(client);
+    }
+    if (strstr(path, "..")) {
+        if (shouldfree) free(path);
+        return send_404(client);
+    }
 
     char full_path[128];
     sprintf(full_path, "public%s", path);
+    if (shouldfree) free(path); // we don't need to know the path anymore
 
     FILE* fp = fopen(full_path, "rb");
 
@@ -175,53 +192,27 @@ void serve_resource(struct client_info* client, const char* path) {
     rewind(fp);
     const char* content_type = get_content_type(full_path);
 
-    #define BSIZE 1024
-    char buffer[BSIZE];
+    #define BSIZE 2048
+    char headers[BSIZE] = "HTTP/1.1 200 OK\r\n"
+                          "Connection: close\r\n";
+    // this seems like a weird way to do this
     
+    sprintf(headers+strlen(headers), "Content-Length: %lu\r\nContent-Type: %s\r\n\r\n", content_length, content_type);
+
+    char* buffer = malloc(strlen(headers)+content_length+1);
+    strcpy(buffer, headers);
+
+    // bad?
+    fread(buffer+strlen(buffer), content_length, 1, fp);
+    printf("Response: %s\n", buffer);
     if (client->tls) {
-        // this is not a good way to do this
-        sprintf(buffer, "HTTP/1.1 200 OK\r\n");
         SSL_write(client->ssl, buffer, strlen(buffer));
-
-        sprintf(buffer, "Connection: close\r\n");
-        SSL_write(client->ssl, buffer, strlen(buffer));
-        
-        sprintf(buffer, "Content-Length: %lu\r\n", content_length);
-        SSL_write(client->ssl, buffer, strlen(buffer));
-
-        sprintf(buffer, "Content-Type: %s\r\n", content_type);
-        SSL_write(client->ssl, buffer, strlen(buffer));
-
-        sprintf(buffer, "\r\n");
-        SSL_write(client->ssl, buffer, strlen(buffer));        
     }
     else {
-                // this is not a good way to do this
-        sprintf(buffer, "HTTP/1.1 200 OK\r\n");
-        send(client->socket, buffer, strlen(buffer), 0);
-
-        sprintf(buffer, "Connection: close\r\n");
-        send(client->socket, buffer, strlen(buffer), 0);
-        
-        sprintf(buffer, "Content-Length: %lu\r\n", content_length);
-        send(client->socket, buffer, strlen(buffer), 0);
-
-        sprintf(buffer, "Content-Type: %s\r\n", content_type);
-        send(client->socket, buffer, strlen(buffer), 0);
-
-        sprintf(buffer, "\r\n");
         send(client->socket, buffer, strlen(buffer), 0);
     }
 
-
-    // bad
-    int r = fread(buffer, 1, BSIZE, fp);
-    while (r) {
-        if (client->tls) SSL_write(client->ssl, buffer, r);
-        else send(client->socket, buffer, r, 0);
-        r = fread(buffer, 1, BSIZE, fp);
-    }
-
+    free(buffer);
     fclose(fp);
     drop_client(client);
 }
