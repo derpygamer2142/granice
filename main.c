@@ -184,37 +184,45 @@ void serve_resource(struct client_info* client, char* path) {
     sprintf(full_path, "public%s", path);
     if (shouldfree) free(path); // we don't need to know the path anymore
 
-    FILE* fp = fopen(full_path, "rb");
+    if (fork()) {
+        FILE* fp = fopen(full_path, "rb");
 
-    if (!fp) return send_404(client);
-    fseek(fp, 0L, SEEK_END);
-    size_t content_length = ftell(fp);
-    rewind(fp);
-    const char* content_type = get_content_type(full_path);
+        if (!fp) return send_404(client);
+        fseek(fp, 0L, SEEK_END);
+        size_t content_length = ftell(fp);
+        rewind(fp);
+        const char* content_type = get_content_type(full_path);
 
-    #define BSIZE 2048
-    char headers[BSIZE] = "HTTP/1.1 200 OK\r\n"
-                          "Connection: close\r\n";
-    // this seems like a weird way to do this
-    
-    sprintf(headers+strlen(headers), "Content-Length: %lu\r\nContent-Type: %s\r\n\r\n", content_length, content_type);
+        #define BSIZE 2048
+        char headers[BSIZE] = "HTTP/1.1 200 OK\r\n"
+                            "Connection: close\r\n";
+        // this seems like a weird way to do this
+        
+        sprintf(headers+strlen(headers), "Content-Length: %lu\r\nContent-Type: %s\r\n\r\n", content_length, content_type);
 
-    char* buffer = malloc(strlen(headers)+content_length+1);
-    strcpy(buffer, headers);
+        char* buffer = malloc(strlen(headers)+content_length+1);
+        strcpy(buffer, headers);
 
-    // bad?
-    fread(buffer+strlen(buffer), content_length, 1, fp);
-    printf("Response: %s\n", buffer);
-    if (client->tls) {
-        SSL_write(client->ssl, buffer, strlen(buffer));
+        // bad?
+        fread(buffer+strlen(buffer), content_length, 1, fp);
+        strcat(buffer, "\0");
+        printf("Response: %s\n", buffer);
+        if (client->tls) {
+            SSL_write(client->ssl, buffer, strlen(buffer));
+        }
+        else {
+            send(client->socket, buffer, strlen(buffer), 0);
+        }
+
+        free(buffer);
+        fclose(fp);
+        drop_client(client);
+        exit(0);
     }
     else {
-        send(client->socket, buffer, strlen(buffer), 0);
-    }
+        drop_client(client);
 
-    free(buffer);
-    fclose(fp);
-    drop_client(client);
+    }
 }
 
 int create_socket(const char* host, const char* port) {
