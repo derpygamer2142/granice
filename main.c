@@ -184,7 +184,7 @@ void serve_resource(struct client_info* client, char* path) {
     sprintf(full_path, "public%s", path);
     if (shouldfree) free(path); // we don't need to know the path anymore
 
-    if (fork()) {
+    if (!fork()) {
         FILE* fp = fopen(full_path, "rb");
 
         if (!fp) return send_404(client);
@@ -217,7 +217,7 @@ void serve_resource(struct client_info* client, char* path) {
         free(buffer);
         fclose(fp);
         drop_client(client);
-        exit(0);
+        exit(0); // todo: this might be preserving client socket connections longer than needed. need to check on that.
     }
     else {
         drop_client(client);
