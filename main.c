@@ -34,6 +34,13 @@ struct client_info {
     int tls;
 };
 
+struct parsed_request {
+    char* path;
+    char* method;
+    char* body;
+    // todo: headers
+};
+
 static struct client_info* clients = 0;
 SSL_CTX* ctx;
 
@@ -59,10 +66,12 @@ struct client_info* get_client(int socket) {
     return n;
 }
 
-void drop_client(struct client_info* client/*, int handshake_successful*/) {
+void drop_client(struct client_info* client, int dry) {
     //if (handshake_successful) SSL_shutdown(client->ssl);
-    close(client->socket);
-    SSL_free(client->ssl);
+    if (!dry) {
+        close(client->socket);
+        SSL_free(client->ssl);
+    }
 
     struct client_info** p = &clients;
 
@@ -120,7 +129,7 @@ void send_400(struct client_info* client) {
                        "Content-Length: 11\r\n\r\nBad Request";
     if (client->tls) SSL_write(client->ssl, text, strlen(text)); // todo: queue this?
     else send(client->socket, text, strlen(text), 0);
-    drop_client(client);
+    drop_client(client, 0);
 }
 
 void send_404(struct client_info* client) {
@@ -130,7 +139,7 @@ void send_404(struct client_info* client) {
                        "Content-Length: 9\r\n\r\nNot Found";
     if (client->tls) SSL_write(client->ssl, text, strlen(text)); // todo: queue this?
     else send(client->socket, text, strlen(text), 0);
-    drop_client(client);
+    drop_client(client, 0);
 }
 
 const char* get_content_type(const char* path) {
@@ -155,7 +164,11 @@ const char* get_content_type(const char* path) {
     return "application/octet-stream";
 }
 
-void serve_resource(struct client_info* client, char* path) {
+/*
+ * returns 0 if response not sent
+ * returns 1 if response sent
+*/
+int serve_directory(char* directory, struct client_info* client, char* path) {
     // todo: queue this?
     // cache files
     printf("serve_resource %s %s\n", get_client_address(client), path);
@@ -171,23 +184,30 @@ void serve_resource(struct client_info* client, char* path) {
         printf("Path: %s\n", path);
         shouldfree = 1;
     }
-    if (strlen(path) > 100) {
+    if (strlen(path) > 100) { // too long, ignore
         if (shouldfree) free(path);
-        return send_400(client);
+        send_400(client);
+        return 1;
     }
-    if (strstr(path, "..")) {
+    if (strstr(path, "..")) { // cringe path traversal attempt
         if (shouldfree) free(path);
-        return send_404(client);
+        send_400(client);
+        return 1;
     }
 
     char full_path[128];
-    sprintf(full_path, "public%s", path);
+    sprintf(full_path, "%s%s", directory, path);
     if (shouldfree) free(path); // we don't need to know the path anymore
 
-    if (!fork()) {
-        FILE* fp = fopen(full_path, "rb");
+    FILE* fp = fopen(full_path, "rb");
 
-        if (!fp) return send_404(client);
+    if (!fp) {
+        printf("Not found\n");
+        // don't need to close the file point because it wasn't created?
+        return 0;
+    }
+
+    if (!fork()) {
         fseek(fp, 0L, SEEK_END);
         size_t content_length = ftell(fp);
         rewind(fp);
@@ -206,7 +226,7 @@ void serve_resource(struct client_info* client, char* path) {
         // bad?
         fread(buffer+strlen(buffer), content_length, 1, fp);
         strcat(buffer, "\0");
-        printf("Response: %s\n", buffer);
+        //printf("Response: %s\n", buffer);
         if (client->tls) {
             SSL_write(client->ssl, buffer, strlen(buffer));
         }
@@ -216,12 +236,14 @@ void serve_resource(struct client_info* client, char* path) {
 
         free(buffer);
         fclose(fp);
-        drop_client(client);
+        drop_client(client, 0);
         exit(0); // todo: this might be preserving client socket connections longer than needed. need to check on that.
     }
     else {
-        drop_client(client);
-
+        // socket will be closed by the child process
+        // only remove from list, don't actually close it
+        drop_client(client, 1);
+        return 1;
     }
 }
 
@@ -274,6 +296,54 @@ int create_socket(const char* host, const char* port) {
     }
 
     return socket_listen;
+}
+
+struct parsed_request* parse_request(struct client_info* client, char* http_request) {
+    struct parsed_request* parsed = (struct parsed_request*) calloc(1, sizeof(struct parsed_request));
+    if (!parsed) {
+        fprintf(stderr, "Out of memory.\n");
+        exit(1);
+    }
+
+    char* original = http_request;
+    printf("Request: %s\n", http_request);
+    int space = strcspn(http_request, " ");
+    if (space == strlen(http_request)) {
+        return 0;
+        send_400(client);
+    }
+    char* method = malloc(space + 1);
+    method[space] = '\0'; // terminate method string
+    strncpy(method, http_request, space);
+    printf("Method: %s\n", method);
+
+    http_request += space+1;
+    space = strcspn(http_request, " \n");
+    char* path = malloc(space + 1);
+    strncpy(path, http_request, space);
+    path[space] = '\0'; // terminate path string
+    printf("Path: %s\n", path);
+
+    parsed->body = strstr(http_request,"\r\n\r\n")+4;
+    parsed->method = method;
+    parsed->path = path;
+
+    printf("Body: %s\n", parsed->body);
+    return parsed;
+}
+
+void handle_request(struct client_info* client, char* request) { // request is null terminated
+    struct parsed_request* parsed = parse_request(client, request);
+    if (!parsed) return;
+
+    if (strncmp("/", parsed->path, 1)) {
+        send_400(client);
+    }
+    else {
+        if (!serve_directory("public", client, parsed->path)) {
+            send_404(client);
+        }
+    }
 }
 
 int main() {
@@ -330,7 +400,7 @@ int main() {
                 ERR_print_errors_fp(stderr);
 
 
-                drop_client(client);
+                drop_client(client, 0);
             }
             else {
                 printf("New https connection from %s, using SSL %s\n", get_client_address(client), SSL_get_cipher(client->ssl));
@@ -377,27 +447,14 @@ int main() {
 
                 if (r < 1) {
                     printf("Unexpected disconnect from %s\n", get_client_address(client));
-                    drop_client(client);
+                    drop_client(client, 0);
                 }
                 else {
                     client->received += r;
                     client->request[client->received] = 0;
-                    char* q = strstr(client->request, "\r\n\r\n");
+                    char* q = strstr(client->request, "\r\n\r\n"); // todo: close socket if client doesn't end request
                     if (q) {
-                        if (strncmp("GET /", client->request, 5)) {
-                            send_400(client);
-                        }
-                        else {
-                            char* path = client->request + 4;
-                            char* end_path = strstr(path, " ");
-                            if (!end_path) {
-                                send_400(client);
-                            }
-                            else {
-                                *end_path = 0;
-                                serve_resource(client, path);
-                            }
-                        }
+                        handle_request(client, client->request);
                     }
 
                 }
