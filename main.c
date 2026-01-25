@@ -21,6 +21,11 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+// compression library wrappers
+// these will be implementations of some libraries
+// that just take a string and return it as a compressed one
+#include "compression_wrappers.h"
+
 #define MAX_REQUEST_SIZE 2048
 
 struct client_info {
@@ -34,11 +39,16 @@ struct client_info {
     int tls;
 };
 
+struct header_list {
+    char** headers;
+    int length;
+};
+
 struct parsed_request {
     char* path;
     char* method;
     char* body;
-    // todo: headers
+    struct header_list* headers;
 };
 
 static struct client_info* clients = 0;
@@ -164,11 +174,54 @@ const char* get_content_type(const char* path) {
     return "application/octet-stream";
 }
 
+struct header_list* get_headers(char* request) {
+    #define MAX_HEADERS 67
+    // this highkirkuinely might leak a whole lot of memory
+    char** headers = calloc(MAX_HEADERS, sizeof(char*)); // completely arbitrary
+    int i = 0;
+    while (i < MAX_HEADERS) {
+        char* next = strstr(request, "\r\n");
+        if (next == request) {
+            struct header_list* retobj = calloc(1, sizeof(struct header_list));
+            retobj->headers = headers;
+            retobj->length = i;
+            return retobj; // next newline is right after the current pointer, that's the start of the body
+        }
+
+        char* temp = malloc(1 + next-request);
+        temp[next-request] = '\0'; // terminate string
+
+        strncpy(temp, request, next-request);
+        headers[i] = temp;
+        //printf("Extracted header: %s\n", temp);
+        request = next+2;
+        i++;
+    }
+}
+
+void free_headers(struct header_list* headers) {
+    for (int i = 0; i < headers->length; i++) {
+        free(headers->headers[i]);
+    }
+    free(headers);
+}
+
+char* get_header_value(struct header_list* headers, char* header) {
+    // search for the value of header in the headers object
+    
+    int headerlen = strlen(header);
+    for (int i = 0; i < headers->length; i++) {
+        if (!strncasecmp(headers->headers[i], header, headerlen)) return headers->headers[i]+headerlen+2;
+    }
+
+    return 0;
+}
+
 /*
  * returns 0 if response not sent
  * returns 1 if response sent
 */
-int serve_directory(char* directory, struct client_info* client, char* path) {
+int serve_directory(char* directory, struct client_info* client, char* path, struct parsed_request* request) {
     // todo: queue this?
     // cache files
     printf("serve_resource %s %s\n", get_client_address(client), path);
@@ -203,7 +256,7 @@ int serve_directory(char* directory, struct client_info* client, char* path) {
 
     if (!fp) {
         printf("Not found\n");
-        // don't need to close the file point because it wasn't created?
+        // don't need to close the file pointer because it wasn't created?
         return 0;
     }
 
@@ -212,32 +265,54 @@ int serve_directory(char* directory, struct client_info* client, char* path) {
         size_t content_length = ftell(fp);
         rewind(fp);
         const char* content_type = get_content_type(full_path);
+        char* filedata = malloc(content_length + 1);
+
+        fread(filedata, content_length, 1, fp);
+        char* accepted_encoding = get_header_value(request->headers, "Accept-Encoding");
+        char* encoding = 0;
+
+        if (accepted_encoding) {
+            if (strstr(accepted_encoding, "deflate")) {
+                char* compressed = zlibDeflate(filedata, content_length, &content_length);
+                free(filedata);
+                filedata = compressed;
+                encoding = "deflate";
+            }
+        }
+            
+
 
         #define BSIZE 2048
         char headers[BSIZE] = "HTTP/1.1 200 OK\r\n"
                             "Connection: close\r\n";
         // this seems like a weird way to do this
-        
+        if (encoding) sprintf(headers+strlen(headers), "Content-Encoding: %s\r\n", encoding); // write the encoding header if it was encoded
+
         sprintf(headers+strlen(headers), "Content-Length: %lu\r\nContent-Type: %s\r\n\r\n", content_length, content_type);
 
         char* buffer = malloc(strlen(headers)+content_length+1);
         strcpy(buffer, headers);
+        
+        int length = strlen(buffer);
+        for (int i = 0; i < content_length; i++) {
+            buffer[length+i] = (unsigned char)filedata[i];
+        }
+        buffer[length+content_length] = '\0';
+        // super weird code
 
-        // bad?
-        fread(buffer+strlen(buffer), content_length, 1, fp);
-        strcat(buffer, "\0");
-        //printf("Response: %s\n", buffer);
+        // todo: cache responses
+
         if (client->tls) {
-            SSL_write(client->ssl, buffer, strlen(buffer));
+            SSL_write(client->ssl, buffer, length+content_length+1);
         }
         else {
-            send(client->socket, buffer, strlen(buffer), 0);
+            send(client->socket, buffer, length+content_length+1, 0);
         }
 
         free(buffer);
         fclose(fp);
         drop_client(client, 0);
-        exit(0); // todo: this might be preserving client socket connections longer than needed. need to check on that.
+        exit(0);
     }
     else {
         // socket will be closed by the child process
@@ -306,29 +381,49 @@ struct parsed_request* parse_request(struct client_info* client, char* http_requ
     }
 
     char* original = http_request;
-    printf("Request: %s\n", http_request);
-    int space = strcspn(http_request, " ");
-    if (space == strlen(http_request)) {
-        return 0;
+    int space = strcspn(http_request, " \r\n"); // get the number of characters to the next space or newline
+    if (space == strlen(http_request)) { // if there isn't any, malformed request
         send_400(client);
+        return 0;
+
     }
     char* method = malloc(space + 1);
     method[space] = '\0'; // terminate method string
     strncpy(method, http_request, space);
-    printf("Method: %s\n", method);
 
     http_request += space+1;
-    space = strcspn(http_request, " \n");
+    space = strcspn(http_request, " "); // get the number of characters to the next space
+    if (space == strlen(http_request)) { // if there isn't one, it's missing the path
+        send_400(client);
+        return 0;
+    }
     char* path = malloc(space + 1);
     strncpy(path, http_request, space);
     path[space] = '\0'; // terminate path string
-    printf("Path: %s\n", path);
+   // printf("Path: %s\n", path);
 
-    parsed->body = strstr(http_request,"\r\n\r\n")+4;
+    http_request += space;
+    char* next = strstr(http_request, "\r\n"); // get the next line in the request, we don't care about the second part(it's the http version)
+    if (next) http_request = next+2;
+    if (http_request[0] == '\r' || http_request[0] == '\n' || http_request[0] == ' ') {
+        // there aren't any headers, this line is immediately followed by an empty line or something
+        parsed->headers = 0;
+    }
+    else {
+        parsed->headers = get_headers(http_request);
+        
+        char* user_agent = get_header_value(parsed->headers, "User-Agent");
+        /*if (user_agent) printf("User agent: %s\n", user_agent); // debug
+        else printf("Couldn't find user agent!\n");*/
+    }
+    
+
+
+    parsed->body = strstr(http_request,"\r\n\r\n")+4; // todo: maybe don't check for body depending on the method?
     parsed->method = method;
     parsed->path = path;
 
-    printf("Body: %s\n", parsed->body);
+    //printf("Body: %s\n", parsed->body);
     return parsed;
 }
 
@@ -340,10 +435,20 @@ void handle_request(struct client_info* client, char* request) { // request is n
         send_400(client);
     }
     else {
-        if (!serve_directory("public", client, parsed->path)) {
+        if (!strcasecmp(parsed->method, "GET")) {
+            if (!serve_directory("public", client, parsed->path, parsed)) {
+                send_404(client);
+            }            
+        }
+        else {
+            // we are only looking at GET requests right now
             send_404(client);
         }
     }
+
+    free(parsed->path);
+    free(parsed->method);
+    free_headers(parsed->headers);
 }
 
 int main() {

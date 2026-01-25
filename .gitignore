@@ -3,3 +3,4 @@ tcp_client
 tcp_client.c
 public/
 *.pem
+*.txt
