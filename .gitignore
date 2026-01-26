@@ -1,6 +1,3 @@
-main
-tcp_client
-tcp_client.c
-public/
-*.pem
-*.txt
+public/*
+test/*
+*.bin

@@ -21,10 +21,13 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
+#define CERT_PATH "test/cert.pem"
+#define KEY_PATH  "test/key.pem"
+
 // compression library wrappers
 // these will be implementations of some libraries
 // that just take a string and return it as a compressed one
-#include "compression_wrappers.h"
+#include "include/compression_wrappers.h"
 
 #define MAX_REQUEST_SIZE 2048
 
@@ -436,7 +439,7 @@ void handle_request(struct client_info* client, char* request) { // request is n
     }
     else {
         if (!strcasecmp(parsed->method, "GET")) {
-            if (!serve_directory("public", client, parsed->path, parsed)) {
+            if (!serve_directory("test/public", client, parsed->path, parsed)) {
                 send_404(client);
             }            
         }
@@ -464,8 +467,8 @@ int main() {
         fprintf(stderr, "SSL_CTX_new() failed\n");
         return 1;
     }
-    if (!SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM)
-    || !SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM)) {
+    if (!SSL_CTX_use_certificate_file(ctx, CERT_PATH, SSL_FILETYPE_PEM)
+    || !SSL_CTX_use_PrivateKey_file(ctx, KEY_PATH, SSL_FILETYPE_PEM)) {
         fprintf(stderr, "SSL_CTX_use_certificate_file() failed\n");
         ERR_print_errors_fp(stderr);
         return 1;
