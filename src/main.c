@@ -29,6 +29,26 @@
 // that just take a string and return it as a compressed one
 #include "include/compression_wrappers.h"
 
+const char* ACCEPTED_ENCODINGS[] = { "deflate" };
+const unsigned int NUM_ACCEPTED_ENCODINGS = 0;
+
+// misc other stuff
+#include "include/hashtable.h"
+
+// completely arbitrary
+#define CACHE_KEY_LENGTH 128
+// in seconds
+#define CACHE_LIFETIME   60
+
+// hash table to cache responses
+HashTable* responseCache;
+
+struct cached_response {
+    time_t last_update;
+    char* response;
+    unsigned int length;
+};
+
 #define MAX_REQUEST_SIZE 2048
 
 struct client_info {
@@ -184,7 +204,7 @@ struct header_list* get_headers(char* request) {
     int i = 0;
     while (i < MAX_HEADERS) {
         char* next = strstr(request, "\r\n");
-        if (next == request) {
+        if (next == request) { 
             struct header_list* retobj = calloc(1, sizeof(struct header_list));
             retobj->headers = headers;
             retobj->length = i;
@@ -206,6 +226,7 @@ void free_headers(struct header_list* headers) {
     for (int i = 0; i < headers->length; i++) {
         free(headers->headers[i]);
     }
+    free(headers->headers);
     free(headers);
 }
 
@@ -218,6 +239,27 @@ char* get_header_value(struct header_list* headers, char* header) {
     }
 
     return 0;
+}
+
+char* generate_hash_key(struct parsed_request* request) {
+    char* accepted_encodings = get_header_value(request->headers, "Accept-Encoding");
+    char* key = malloc(CACHE_KEY_LENGTH); // one must imagine sisyphus happy. so much malloc. so much memory.
+
+    // find an encoding that both the client and this server accept
+    char* encoding = 0;
+    for (int i = 0; i < NUM_ACCEPTED_ENCODINGS; i++) {
+        if (strstr(accepted_encodings, ACCEPTED_ENCODINGS[i])) {
+            encoding = ACCEPTED_ENCODINGS[i];
+            break;
+        }
+    }
+
+    // todo: this could probably be a bit better
+    if (encoding) snprintf(key, CACHE_KEY_LENGTH-1, "%s %s", request->path, encoding);
+    else snprintf(key, CACHE_KEY_LENGTH-1, "%s", request->path);
+    key[CACHE_KEY_LENGTH-1] = '\0'; // a little odd but this should ensure the key is null-terminated
+
+    return key;
 }
 
 /*
@@ -263,58 +305,101 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         return 0;
     }
 
+    char* key = generate_hash_key(request);
+
+    // if there is a cached response younger than CACHE_LIFETIME, send that
+    // otherwise go through the normal stuff
+
+    struct cached_response* cached = hash_get(responseCache, key, strlen(key));
+    if (!cached) {
+        printf("Cache miss\n");
+        // initialize a cache entry to be updated by the child thread
+        // this is done in the main thread to avoid problems with resizing memory on child threads
+        // note: i don't think resizing the memory on the main thread will cause problems
+        // because the memory should be preserved until all child threads are killed
+        // but i'm not completely sure
+
+        struct cached_response* entry = calloc(1, sizeof(struct cached_response));
+
+        entry->last_update = 0;
+        entry->length = 0;
+        entry->response = 0;
+
+        hash_store(responseCache, key, strlen(key), (void*) entry);
+
+        cached = entry; // make it easier for the child thread to edit the entry
+    }
+    else {
+        printf("Cache hit\n");
+    }
+    free(key);
+
     if (!fork()) {
-        fseek(fp, 0L, SEEK_END);
-        size_t content_length = ftell(fp);
-        rewind(fp);
-        const char* content_type = get_content_type(full_path);
-        char* filedata = malloc(content_length + 1);
+        time_t timer;
+        time(&timer);
+        if (timer - cached->last_update >= CACHE_LIFETIME) {
+            printf("Expired cache, %li\n", timer - cached->last_update);
+            // cache is expired, update
 
-        fread(filedata, content_length, 1, fp);
-        char* accepted_encoding = get_header_value(request->headers, "Accept-Encoding");
-        char* encoding = 0;
+            fseek(fp, 0L, SEEK_END);
+            size_t content_length = ftell(fp);
+            rewind(fp);
+            const char* content_type = get_content_type(full_path);
+            char* filedata = malloc(content_length + 1);
 
-        if (accepted_encoding) {
-            if (strstr(accepted_encoding, "deflate")) {
-                char* compressed = zlibDeflate(filedata, content_length, &content_length);
-                free(filedata);
-                filedata = compressed;
-                encoding = "deflate";
+            fread(filedata, content_length, 1, fp);
+            char* accepted_encoding = get_header_value(request->headers, "Accept-Encoding");
+            char* encoding = 0;
+
+            if (accepted_encoding) {
+                if (strstr(accepted_encoding, "deflate")) {
+                    char* compressed = zlibDeflate(filedata, content_length, &content_length);
+                    free(filedata);
+                    filedata = compressed;
+                    encoding = "deflate";
+                }
             }
-        }
+                
+
+
+            #define BSIZE 2048
+            char headers[BSIZE] = "HTTP/1.1 200 OK\r\n"
+                                "Connection: close\r\n";
+            // this seems like a weird way to do this
+            if (encoding) sprintf(headers+strlen(headers), "Content-Encoding: %s\r\n", encoding); // write the encoding header if it was encoded
+            sprintf(headers+strlen(headers), "Content-Length: %lu\r\nContent-Type: %s\r\n\r\n", content_length, content_type);
+
+            char* buffer = malloc(strlen(headers)+content_length+1);
+            strcpy(buffer, headers);
             
+            int length = strlen(buffer);
+            for (int i = 0; i < content_length; i++) {
+                buffer[length+i] = (unsigned char)filedata[i];
+            }
+            buffer[length+content_length] = '\0';
+            // super weird code
 
+            time(&cached->last_update);
+            cached->response = buffer; // todo: this won't work because the pointer only exists on this child
+            cached->length = length+content_length+1;
 
-        #define BSIZE 2048
-        char headers[BSIZE] = "HTTP/1.1 200 OK\r\n"
-                            "Connection: close\r\n";
-        // this seems like a weird way to do this
-        if (encoding) sprintf(headers+strlen(headers), "Content-Encoding: %s\r\n", encoding); // write the encoding header if it was encoded
-
-        sprintf(headers+strlen(headers), "Content-Length: %lu\r\nContent-Type: %s\r\n\r\n", content_length, content_type);
-
-        char* buffer = malloc(strlen(headers)+content_length+1);
-        strcpy(buffer, headers);
-        
-        int length = strlen(buffer);
-        for (int i = 0; i < content_length; i++) {
-            buffer[length+i] = (unsigned char)filedata[i];
         }
-        buffer[length+content_length] = '\0';
-        // super weird code
-
-        // todo: cache responses
 
         if (client->tls) {
-            SSL_write(client->ssl, buffer, length+content_length+1);
+            SSL_write(client->ssl, cached->response, cached->length);
         }
         else {
-            send(client->socket, buffer, length+content_length+1, 0);
+            send(client->socket, cached->response, cached->length, 0);
         }
 
-        free(buffer);
+        // free(buffer);
+        // freeing is done later because the response is cached
         fclose(fp);
         drop_client(client, 0);
+        free_headers(request->headers);
+        free(request->path);
+        free(request->method);
+        free(request);
         exit(0);
     }
     else {
@@ -439,9 +524,14 @@ void handle_request(struct client_info* client, char* request) { // request is n
     }
     else {
         if (!strcasecmp(parsed->method, "GET")) {
+            if (strchr(parsed->path, ' ')) {
+                send_400(client);
+                return;
+            }
+
             if (!serve_directory("test/public", client, parsed->path, parsed)) {
                 send_404(client);
-            }            
+            }
         }
         else {
             // we are only looking at GET requests right now
@@ -452,6 +542,7 @@ void handle_request(struct client_info* client, char* request) { // request is n
     free(parsed->path);
     free(parsed->method);
     free_headers(parsed->headers);
+    free(parsed);
 }
 
 int main() {
@@ -477,6 +568,8 @@ int main() {
 
     int https_server = create_socket(0, "443");
     int http_server  = create_socket(0, "80");
+
+    responseCache = hash_table_init(0);
 
     while (1) {
         fd_set reads;
@@ -560,7 +653,7 @@ int main() {
                 else {
                     client->received += r;
                     client->request[client->received] = 0;
-                    char* q = strstr(client->request, "\r\n\r\n"); // todo: close socket if client doesn't end request
+                    char* q = strstr(client->request, "\r\n\r\n"); // todo: close socket if client doesn't end request, handle post body?
                     if (q) {
                         handle_request(client, client->request);
                     }

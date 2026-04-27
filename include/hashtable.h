@@ -34,7 +34,7 @@ HashTable* hash_table_init(unsigned int start_size) {
     HashTable* table = (HashTable*) calloc(1, sizeof(HashTable));
     table->size = start_size;
     table->used = 0;
-    HashEntry** dataArray = (HashEntry**)calloc(start_size, sizeof(HashEntry*));
+    HashEntry** dataArray = (HashEntry**) calloc(start_size, sizeof(HashEntry*));
     table->data = dataArray;
 
     table->entries = (HashEntry**) calloc(start_size, sizeof(HashEntry*));
@@ -210,6 +210,8 @@ void* hash_get(HashTable* table, char* key, int len) {
 
 // Removes the value of a given key and optionally free the value. Returns the value.
 // Does not change the number of used entries because that would be difficult.
+// Note: I am fairly confident that this doesn't work. Needs to be fixed at some point.
+/*
 void* hash_remove(HashTable* table, char* key, int len, int freeValue) {
     uint32_t hashResult = SuperFastHash(key, len);
     uint32_t index = hashResult % table->size;
@@ -237,5 +239,6 @@ void* hash_remove(HashTable* table, char* key, int len, int freeValue) {
 
     return oldValue;
 }
+*/
 
 #endif
