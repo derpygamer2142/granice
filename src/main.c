@@ -30,7 +30,7 @@
 #include "include/compression_wrappers.h"
 
 const char* ACCEPTED_ENCODINGS[] = { "deflate" };
-const unsigned int NUM_ACCEPTED_ENCODINGS = 0;
+const unsigned int NUM_ACCEPTED_ENCODINGS = 1;
 
 // misc other stuff
 #include "include/hashtable.h"
@@ -39,6 +39,8 @@ const unsigned int NUM_ACCEPTED_ENCODINGS = 0;
 #define CACHE_KEY_LENGTH 128
 // in seconds
 #define CACHE_LIFETIME   60
+// in bytes
+#define CACHE_REQUEST_ALLOC 4096
 
 // hash table to cache responses
 HashTable* responseCache;
@@ -46,7 +48,8 @@ HashTable* responseCache;
 struct cached_response {
     time_t last_update;
     char* response;
-    unsigned int length;
+    size_t length;
+    size_t alloc_size;
 };
 
 #define MAX_REQUEST_SIZE 2048
@@ -312,33 +315,42 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
 
     struct cached_response* cached = hash_get(responseCache, key, strlen(key));
     if (!cached) {
-        printf("Cache miss\n");
         // initialize a cache entry to be updated by the child thread
         // this is done in the main thread to avoid problems with resizing memory on child threads
         // note: i don't think resizing the memory on the main thread will cause problems
         // because the memory should be preserved until all child threads are killed
         // but i'm not completely sure
 
-        struct cached_response* entry = calloc(1, sizeof(struct cached_response));
+        struct cached_response* entry = calloc_shm(1, sizeof(struct cached_response));
 
         entry->last_update = 0;
         entry->length = 0;
-        entry->response = 0;
+        entry->alloc_size = CACHE_REQUEST_ALLOC;
+        // This is kind of cursed. We start off by allocating some memory
+        // and keeping the length at 0. In the child process(where we read contents)
+        // if the content length exceeds the allocated memory we write
+        // the content length and the main thread will reallocate the memory.
+        entry->response = (char*) malloc_shm(CACHE_REQUEST_ALLOC);
 
         hash_store(responseCache, key, strlen(key), (void*) entry);
 
         cached = entry; // make it easier for the child thread to edit the entry
     }
     else {
-        printf("Cache hit\n");
+        if (cached->length > cached->alloc_size) {
+            munmap(cached->response, cached->alloc_size);
+            cached->response = (char*) malloc_shm(cached->length);
+            cached->alloc_size = cached->length;
+        }
     }
     free(key);
 
     if (!fork()) {
         time_t timer;
         time(&timer);
+        char* out = 0;
+
         if (timer - cached->last_update >= CACHE_LIFETIME) {
-            printf("Expired cache, %li\n", timer - cached->last_update);
             // cache is expired, update
 
             fseek(fp, 0L, SEEK_END);
@@ -379,18 +391,25 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
             buffer[length+content_length] = '\0';
             // super weird code
 
-            time(&cached->last_update);
-            cached->response = buffer; // todo: this won't work because the pointer only exists on this child
-            cached->length = length+content_length+1;
+            if (cached->alloc_size >= length+content_length+1) {
+                memcpy(cached->response, buffer, length+content_length+1);
+                time(&cached->last_update);
+                free(buffer);
+            }
+            else {
+                out = buffer;
+            }
 
+            cached->length = length+content_length+1;
         }
 
         if (client->tls) {
-            SSL_write(client->ssl, cached->response, cached->length);
+            SSL_write(client->ssl, out ? out : cached->response, cached->length);
         }
         else {
-            send(client->socket, cached->response, cached->length, 0);
+            send(client->socket, out ? out : cached->response, cached->length, 0);
         }
+        if (out) free(out);
 
         // free(buffer);
         // freeing is done later because the response is cached

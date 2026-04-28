@@ -4,6 +4,7 @@
 #include "include/superfasthash.h"
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 
 #include <stdio.h>
 
@@ -28,16 +29,19 @@ typedef struct {
     HashEntry** entries; // for linear lookup
 } HashTable;
 
+void* calloc_shm(size_t __nmemb, size_t __size) { return mmap(NULL, __nmemb * __size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0); }
+void* malloc_shm(size_t __size) { return mmap(NULL, __size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0); }
+
 // Initialize a hash table with an initial size of start_size. If start_size is 0, it will default to an arbitrary one.
 HashTable* hash_table_init(unsigned int start_size) {
     if (start_size == 0) start_size = 67; // 67 is a prime number and therefore it should be efficient
-    HashTable* table = (HashTable*) calloc(1, sizeof(HashTable));
+    HashTable* table = (HashTable*) calloc_shm(1, sizeof(HashTable));
     table->size = start_size;
     table->used = 0;
-    HashEntry** dataArray = (HashEntry**) calloc(start_size, sizeof(HashEntry*));
+    HashEntry** dataArray = (HashEntry**) calloc_shm(start_size, sizeof(HashEntry*));
     table->data = dataArray;
 
-    table->entries = (HashEntry**) calloc(start_size, sizeof(HashEntry*));
+    table->entries = (HashEntry**) calloc_shm(start_size, sizeof(HashEntry*));
 
     return table;
 }
@@ -47,14 +51,13 @@ void destroy_hash_table(HashTable* table, int free_entries) {
     for (int i = 0; i < table->used; i++) {
         if (table->entries[i]) {
             if (free_entries) free(table->entries[i]->value); // free() all non-null values in the hash table.
-            free(table->entries[i]);
+            munmap(table->entries[i], sizeof(HashEntry));
         }
     }
     
-
-    free(table->data); // free the table data
-    free(table->entries); // free entry list
-    free(table); // free the table itself
+    munmap(table->data, sizeof(HashEntry*) * table->size); // free the table data
+    munmap(table->entries, sizeof(HashEntry*) * table->size);
+    munmap(table, sizeof(HashTable)); // free the table itself
 }
 
 // Store a value at a given pre-hashed key in a hash table. Returns the number of used entries. Does not resize, returns 0 for error. Internal.
@@ -87,7 +90,7 @@ unsigned int _hash_store_prehashed(HashTable* table, uint32_t hashResult, void* 
 
             if (!data[index]) {
 
-                data[index] = (HashEntry*) calloc(1, sizeof(HashEntry)); // new entry
+                data[index] = (HashEntry*) calloc_shm(1, sizeof(HashEntry)); // new entry
 
                 data[index]->key = hashResult;
                 data[index]->value = value;
@@ -101,7 +104,7 @@ unsigned int _hash_store_prehashed(HashTable* table, uint32_t hashResult, void* 
         }
     }
     else {
-        data[index] = (HashEntry*) calloc(1, sizeof(HashEntry)); // new entry
+        data[index] = (HashEntry*) calloc_shm(1, sizeof(HashEntry)); // new entry
         data[index]->key = hashResult;
         data[index]->value = value;
         data[index]->index = table->used;
@@ -118,8 +121,8 @@ unsigned int _hash_store_prehashed(HashTable* table, uint32_t hashResult, void* 
 int resize_hash_table(HashTable* table) {
 
     int originalSize = table->size;
-    HashEntry** newData = (HashEntry**) calloc(originalSize*2 + 1, sizeof(HashEntry*)); // double the size plus one
-    free(table->data);
+    HashEntry** newData = (HashEntry**) calloc_shm(originalSize*2 + 1, sizeof(HashEntry*)); // double the size plus one
+    munmap(table->data, sizeof(HashEntry*) * originalSize);
     table->data = newData; // this shouldn't leak memory?
     table->size = originalSize*2 + 1; // update size
     unsigned int tempUsed = table->used;
@@ -128,7 +131,7 @@ int resize_hash_table(HashTable* table) {
     // very small optimization, but use malloc instead of calloc
     // because we don't care about the memory being zeroed
     // since the initialized memory is being copied anyways
-    HashEntry** newEntries = (HashEntry**) malloc(table->size * sizeof(HashEntry*));
+    HashEntry** newEntries = (HashEntry**) malloc_shm(table->size * sizeof(HashEntry*));
     HashEntry** oldEntries = table->entries;
     table->entries = newEntries;
 
@@ -140,21 +143,18 @@ int resize_hash_table(HashTable* table) {
                 // avoid the annoying edge case that we hit another overflow while resizing
                 i = -1;
                 originalSize = table->size;
-                HashEntry** newData = (HashEntry**) calloc(originalSize*2 + 1, sizeof(HashEntry*)); // double the size plus one
+                HashEntry** newData = (HashEntry**) calloc_shm(originalSize*2 + 1, sizeof(HashEntry*)); // double the size plus one
 
-                free(table->data);
+                munmap(table->data, sizeof(HashEntry*) * originalSize);
                 table->data = newData; // this shouldn't leak memory?
                 table->size = originalSize*2 + 1; // update size
 
-                // very small optimization, but use malloc instead of calloc
-                // because we don't care about the memory being zeroed
-                // since the initialized memory is being copied anyways
-                HashEntry** newEntries = (HashEntry**) malloc(table->size * sizeof(HashEntry*));
+                HashEntry** newEntries = (HashEntry**) malloc_shm(table->size * sizeof(HashEntry*));
 
                 for (int i = 0; i < table->used; i++) {
-                    free(table->entries[i]);
+                    munmap(table->entries[i], sizeof(HashEntry));
                 }
-                free(table->entries); // this is pointing to an unused piece of memory, so we can free it
+                munmap(table->entries, sizeof(HashEntry*) * originalSize); // this is pointing to an unused piece of memory, so we can free it
 
                 table->entries = newEntries;
                 table->used = 0;
@@ -162,10 +162,10 @@ int resize_hash_table(HashTable* table) {
     }
 
     for (int i = 0; i < tempUsed; i++) {
-        free(oldEntries[i]);
+        munmap(oldEntries[i], sizeof(HashEntry));
     }
 
-    free(oldEntries);
+    munmap(oldEntries, sizeof(HashEntry*) * originalSize);
 
     return table->size;
 }
