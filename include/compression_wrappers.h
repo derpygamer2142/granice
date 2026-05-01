@@ -9,13 +9,17 @@
 
 #define CHUNK 16384
 
-char* zlibDeflate(char* input, unsigned int size, size_t* outSize) {
+char* zlibGzip(char* input, unsigned int size, size_t* outSize) {
     // based on https://zlib.net/zpipe.c
     z_stream stream;
     stream.zalloc = Z_NULL;
     stream.zfree  = Z_NULL;
     stream.opaque = Z_NULL;
-    deflateInit(&stream, Z_DEFAULT_COMPRESSION);
+    int ret = deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY);
+
+    if (ret != Z_OK) {
+        fprintf(stderr, "Deflate init error\n");
+    }
 
     size_t max = compressBound(size);
     unsigned char* out = (unsigned char*)malloc(max);
@@ -25,8 +29,8 @@ char* zlibDeflate(char* input, unsigned int size, size_t* outSize) {
     stream.next_out = out;
     stream.avail_out = max;
 
-    int ret = deflate(&stream, Z_FINISH);
-    assert(ret == Z_STREAM_END); // maybe don't do this
+    ret = deflate(&stream, Z_FINISH);
+    //assert(ret == Z_STREAM_END); // maybe don't do this
 
     *outSize = stream.total_out;
     deflateEnd(&stream);

@@ -21,15 +21,12 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#define CERT_PATH "test/cert.pem"
-#define KEY_PATH  "test/key.pem"
-
 // compression library wrappers
 // these will be implementations of some libraries
 // that just take a string and return it as a compressed one
 #include "include/compression_wrappers.h"
 
-const char* ACCEPTED_ENCODINGS[] = { "deflate" };
+char* ACCEPTED_ENCODINGS[] = { "gzip" };
 const unsigned int NUM_ACCEPTED_ENCODINGS = 1;
 
 // misc other stuff
@@ -38,7 +35,7 @@ const unsigned int NUM_ACCEPTED_ENCODINGS = 1;
 // completely arbitrary
 #define CACHE_KEY_LENGTH 128
 // in seconds
-#define CACHE_LIFETIME   60
+#define CACHE_LIFETIME   0
 // in bytes
 #define CACHE_REQUEST_ALLOC 4096
 
@@ -102,12 +99,11 @@ struct client_info* get_client(int socket) {
     return n;
 }
 
-void drop_client(struct client_info* client, int dry) {
+void drop_client(struct client_info* client) {
     //if (handshake_successful) SSL_shutdown(client->ssl);
-    if (!dry) {
-        close(client->socket);
-        SSL_free(client->ssl);
-    }
+    close(client->socket);
+    SSL_free(client->ssl);
+    
 
     struct client_info** p = &clients;
 
@@ -165,7 +161,7 @@ void send_400(struct client_info* client) {
                        "Content-Length: 11\r\n\r\nBad Request";
     if (client->tls) SSL_write(client->ssl, text, strlen(text)); // todo: queue this?
     else send(client->socket, text, strlen(text), 0);
-    drop_client(client, 0);
+    drop_client(client);
 }
 
 void send_404(struct client_info* client) {
@@ -175,7 +171,17 @@ void send_404(struct client_info* client) {
                        "Content-Length: 9\r\n\r\nNot Found";
     if (client->tls) SSL_write(client->ssl, text, strlen(text)); // todo: queue this?
     else send(client->socket, text, strlen(text), 0);
-    drop_client(client, 0);
+    drop_client(client);
+}
+
+void send_501(struct client_info* client) {
+    printf("sent 501\n");
+    const char* text = "HTTP/1.1 501 Not Implemented\r\n"
+                       "Connection: close\r\n"
+                       "Content-Length: 15\r\n\r\nNot Implemented";
+    if (client->tls) SSL_write(client->ssl, text, strlen(text)); // todo: queue this?
+    else send(client->socket, text, strlen(text), 0);
+    drop_client(client);
 }
 
 const char* get_content_type(const char* path) {
@@ -195,6 +201,7 @@ const char* get_content_type(const char* path) {
         if (strcmp(last_dot, ".pdf") == 0) return "application/pdf";
         if (strcmp(last_dot, ".svg") == 0) return "image/svg+xml";
         if (strcmp(last_dot, ".txt") == 0) return "text/plain";
+        if (strcmp(last_dot, ".md") == 0) return "text/markdown";
     }
 
     return "application/octet-stream";
@@ -280,9 +287,9 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         char* temppath = malloc(strlen(path) + strlen(".html") + 1);
         strcpy(temppath, path);
         strcat(temppath, ".html");
-        printf("Correcting path %s to %s\n", path, temppath);
+        //printf("Correcting path %s to %s\n", path, temppath);
         path = temppath;
-        printf("Path: %s\n", path);
+        //printf("Path: %s\n", path);
         shouldfree = 1;
     }
     if (strlen(path) > 100) { // too long, ignore
@@ -303,7 +310,7 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
     FILE* fp = fopen(full_path, "rb");
 
     if (!fp) {
-        printf("Not found\n");
+        printf("Not found: %s\n", path);
         // don't need to close the file pointer because it wasn't created?
         return 0;
     }
@@ -364,11 +371,11 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
             char* encoding = 0;
 
             if (accepted_encoding) {
-                if (strstr(accepted_encoding, "deflate")) {
-                    char* compressed = zlibDeflate(filedata, content_length, &content_length);
+                if (strstr(accepted_encoding, "gzip")) {
+                    char* compressed = zlibGzip(filedata, content_length, &content_length);
                     free(filedata);
                     filedata = compressed;
-                    encoding = "deflate";
+                    encoding = "gzip";
                 }
             }
                 
@@ -403,6 +410,7 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
             cached->length = length+content_length+1;
         }
 
+        printf("Response: %s\n", cached->response);
         if (client->tls) {
             SSL_write(client->ssl, out ? out : cached->response, cached->length);
         }
@@ -414,23 +422,25 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         // free(buffer);
         // freeing is done later because the response is cached
         fclose(fp);
-        drop_client(client, 0);
+        drop_client(client);
         free_headers(request->headers);
         free(request->path);
         free(request->method);
         free(request);
+        printf("Child done with request\n");
         exit(0);
     }
     else {
-        // socket will be closed by the child process
-        // only remove from list, don't actually close it
-        drop_client(client, 1);
+        // sockets might be preserved if the parent process doesn't close it
+        // this causes problems in older browsers
+        // modern browsers will automatically close it i think
+        drop_client(client);
         return 1;
     }
 }
 
 int create_socket(const char* host, const char* port) {
-    printf("Configuring local address\n");
+    //printf("Configuring local address\n");
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -440,7 +450,7 @@ int create_socket(const char* host, const char* port) {
     struct addrinfo *bind_address;
     getaddrinfo(host, port, &hints, &bind_address);
 
-    printf("Creating socket\n");
+    //printf("Creating socket\n");
     int socket_listen;
     socket_listen = socket(bind_address->ai_family,
         bind_address->ai_socktype, bind_address->ai_protocol);
@@ -464,14 +474,14 @@ int create_socket(const char* host, const char* port) {
         exit(1);
     }*/
 
-    printf("Binding socket\n");
+    //printf("Binding socket\n");
     if (bind(socket_listen, bind_address->ai_addr, bind_address->ai_addrlen)) {
         fprintf(stderr, "bind() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }
     freeaddrinfo(bind_address);
 
-    printf("Now listening\n");
+    //printf("Now listening\n");
     if (listen(socket_listen, 10)) {
         fprintf(stderr, "listen() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
@@ -534,11 +544,12 @@ struct parsed_request* parse_request(struct client_info* client, char* http_requ
     return parsed;
 }
 
-void handle_request(struct client_info* client, char* request) { // request is null terminated
+void handle_request(struct client_info* client, char* request, char* serve) { // request is null terminated
+    printf("Request %s\n", request);
     struct parsed_request* parsed = parse_request(client, request);
     if (!parsed) return;
 
-    if (strncmp("/", parsed->path, 1)) {
+    if (strncmp("/", parsed->path, 1)) { // not a path
         send_400(client);
     }
     else {
@@ -548,7 +559,7 @@ void handle_request(struct client_info* client, char* request) { // request is n
                 return;
             }
 
-            if (!serve_directory("test/public", client, parsed->path, parsed)) {
+            if (!serve_directory(serve, client, parsed->path, parsed)) {
                 send_404(client);
             }
         }
@@ -562,11 +573,25 @@ void handle_request(struct client_info* client, char* request) { // request is n
     free(parsed->method);
     free_headers(parsed->headers);
     free(parsed);
+    printf("Served request\n");
 }
 
-int main() {
+int main(int argc, char* argv[]) {
 
     signal(SIGPIPE, SIG_IGN);
+
+    char cert_path[128];
+    char key_path[128];
+
+    if (argc > 2) {
+        printf("Serving %s with SSL files from directory %s\n", argv[2], argv[1]);
+        sprintf(cert_path, "%s/cert.pem", argv[1]);
+        sprintf(key_path, "%s/key.pem", argv[1]);
+    }
+    else {
+        fprintf(stderr, "Failed to start.\nUsage: server.bin /certificate/directory/ /serve/directory/\n");
+        exit(1);
+    }
 
     SSL_library_init();
     OpenSSL_add_all_algorithms();
@@ -577,16 +602,16 @@ int main() {
         fprintf(stderr, "SSL_CTX_new() failed\n");
         return 1;
     }
-    if (!SSL_CTX_use_certificate_file(ctx, CERT_PATH, SSL_FILETYPE_PEM)
-    || !SSL_CTX_use_PrivateKey_file(ctx, KEY_PATH, SSL_FILETYPE_PEM)) {
+    if (!SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM)
+    || !SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM)) {
         fprintf(stderr, "SSL_CTX_use_certificate_file() failed\n");
         ERR_print_errors_fp(stderr);
         return 1;
     }
 
 
-    int https_server = create_socket(0, "443");
-    int http_server  = create_socket(0, "80");
+    int https_server = create_socket("0.0.0.0", "443");
+    int http_server  = create_socket("0.0.0.0", "80");
 
     responseCache = hash_table_init(0);
 
@@ -620,7 +645,7 @@ int main() {
                 ERR_print_errors_fp(stderr);
 
 
-                drop_client(client, 0);
+                drop_client(client);
             }
             else {
                 printf("New https connection from %s, using SSL %s\n", get_client_address(client), SSL_get_cipher(client->ssl));
@@ -667,14 +692,14 @@ int main() {
 
                 if (r < 1) {
                     printf("Unexpected disconnect from %s\n", get_client_address(client));
-                    drop_client(client, 0);
+                    drop_client(client);
                 }
                 else {
                     client->received += r;
                     client->request[client->received] = 0;
                     char* q = strstr(client->request, "\r\n\r\n"); // todo: close socket if client doesn't end request, handle post body?
                     if (q) {
-                        handle_request(client, client->request);
+                        handle_request(client, client->request, argv[2]);
                     }
 
                 }
@@ -684,10 +709,10 @@ int main() {
         }
     }
 
-    printf("\nClosing socket\n");
+    //printf("\nClosing socket\n");
     close(https_server);
     close(http_server);
     SSL_CTX_free(ctx);
-    printf("Finished");
+    //printf("Finished");
     return 0;
 }
