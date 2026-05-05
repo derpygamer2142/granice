@@ -264,11 +264,14 @@ char* generate_hash_key(struct parsed_request* request) {
 
     // find an encoding that both the client and this server accept
     char* encoding = 0;
-    for (int i = 0; i < NUM_ACCEPTED_ENCODINGS; i++) {
-        if (strstr(accepted_encodings, ACCEPTED_ENCODINGS[i])) {
-            encoding = ACCEPTED_ENCODINGS[i];
-            break;
-        }
+
+    if (accepted_encodings) {
+        for (int i = 0; i < NUM_ACCEPTED_ENCODINGS; i++) {
+            if (strstr(accepted_encodings, ACCEPTED_ENCODINGS[i])) {
+                encoding = ACCEPTED_ENCODINGS[i];
+                break;
+            }
+        }        
     }
 
     // todo: this could probably be a bit better
