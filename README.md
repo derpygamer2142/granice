@@ -13,7 +13,7 @@ Weird C web server, almost certainly super insecure so don't use this for anythi
  - Linux based operating system because windows is for nerds. Windows support will come if I get paid to add it, which isn't happening.
 
 ```bash
-sudo apt install zlib1g-dev openssl
+sudo apt install zlib1g-dev libssl-dev
 ```
 
 ## Building

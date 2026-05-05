@@ -2,8 +2,9 @@ FROM ubuntu:26.04
 
 WORKDIR /app
 RUN apt update
-RUN apt-get install -y zlib1g-dev openssl build-essential
+RUN apt-get install -y zlib1g-dev libssl-dev build-essential
 COPY . .
+RUN mkdir build
 RUN make
 EXPOSE 80 443
 
