@@ -35,7 +35,7 @@ const unsigned int NUM_ACCEPTED_ENCODINGS = 1;
 // completely arbitrary
 #define CACHE_KEY_LENGTH 128
 // in seconds
-#define CACHE_LIFETIME   0
+#define CACHE_LIFETIME   90
 // in bytes
 #define CACHE_REQUEST_ALLOC 4096
 
@@ -47,6 +47,7 @@ struct cached_response {
     char* response;
     size_t length;
     size_t alloc_size;
+    size_t header_length;
 };
 
 #define MAX_REQUEST_SIZE 2048
@@ -155,7 +156,7 @@ fd_set wait_on_clients(int https, int http) {
 }
 
 void send_400(struct client_info* client) {
-    printf("sent 400\n");
+    // printf("sent 400\n");
     const char* text = "HTTP/1.1 400 Bad Request\r\n"
                        "Connection: close\r\n"
                        "Content-Length: 11\r\n\r\nBad Request";
@@ -165,7 +166,7 @@ void send_400(struct client_info* client) {
 }
 
 void send_404(struct client_info* client) {
-    printf("sent 404\n");
+    // printf("sent 404\n");
     const char* text = "HTTP/1.1 404 Not Found\r\n"
                        "Connection: close\r\n"
                        "Content-Length: 9\r\n\r\nNot Found";
@@ -175,12 +176,18 @@ void send_404(struct client_info* client) {
 }
 
 void send_501(struct client_info* client) {
-    printf("sent 501\n");
+    // printf("sent 501\n");
     const char* text = "HTTP/1.1 501 Not Implemented\r\n"
                        "Connection: close\r\n"
                        "Content-Length: 15\r\n\r\nNot Implemented";
     if (client->tls) SSL_write(client->ssl, text, strlen(text)); // todo: queue this?
     else send(client->socket, text, strlen(text), 0);
+    drop_client(client);
+}
+
+void send_uncached(struct client_info* client, char* response, int length) {
+    if (client->tls) SSL_write(client->ssl, response, length); // todo: queue this?
+    else send(client->socket, response, length, 0);
     drop_client(client);
 }
 
@@ -209,7 +216,7 @@ const char* get_content_type(const char* path) {
 
 struct header_list* get_headers(char* request) {
     #define MAX_HEADERS 67
-    // this highkirkuinely might leak a whole lot of memory
+    // this highkirkuinely might leak a whole lot of memory if it doesn't get freed properly
     char** headers = calloc(MAX_HEADERS, sizeof(char*)); // completely arbitrary
     int i = 0;
     while (i < MAX_HEADERS) {
@@ -272,17 +279,14 @@ char* generate_hash_key(struct parsed_request* request) {
     return key;
 }
 
-/*
- * returns 0 if response not sent
- * returns 1 if response sent
-*/
-int serve_directory(char* directory, struct client_info* client, char* path, struct parsed_request* request) {
-    // todo: queue this?
-    // cache files
-    printf("serve_resource %s %s\n", get_client_address(client), path);
+char* sanitize_file_path(char* directory, char* path, struct client_info* client) {
     int shouldfree = 0;
 
     if (strcmp(path, "/") == 0) path = "/index.html";
+    int pathlen = strlen(path);
+    if (path[pathlen-1] == '/') {
+        path[pathlen-1] = '\0';
+    }
     if (strrchr(path, '.') <= strrchr(path, '/')) {
         char* temppath = malloc(strlen(path) + strlen(".html") + 1);
         strcpy(temppath, path);
@@ -295,22 +299,35 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
     if (strlen(path) > 100) { // too long, ignore
         if (shouldfree) free(path);
         send_400(client);
-        return 1;
+        return 0;
     }
     if (strstr(path, "..")) { // cringe path traversal attempt
         if (shouldfree) free(path);
         send_400(client);
-        return 1;
+        return 0;
     }
 
-    char full_path[128];
+    char* full_path = malloc(128);
     sprintf(full_path, "%s%s", directory, path);
     if (shouldfree) free(path); // we don't need to know the path anymore
+
+    return full_path;
+}
+
+/*
+ * returns 0 if response not sent
+ * returns 1 if response sent
+*/
+int serve_directory(char* directory, struct client_info* client, char* path, struct parsed_request* request) {
+    // printf("serve_resource %s %s\n", get_client_address(client), path);
+    char* full_path = sanitize_file_path(directory, path, client);
+    if (!full_path) return 1;
 
     FILE* fp = fopen(full_path, "rb");
 
     if (!fp) {
-        printf("Not found: %s\n", path);
+        // printf("Not found: %s, %s\n", path, full_path);
+        free(full_path);
         // don't need to close the file pointer because it wasn't created?
         return 0;
     }
@@ -333,6 +350,7 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         entry->last_update = 0;
         entry->length = 0;
         entry->alloc_size = CACHE_REQUEST_ALLOC;
+        entry->header_length = 0;
         // This is kind of cursed. We start off by allocating some memory
         // and keeping the length at 0. In the child process(where we read contents)
         // if the content length exceeds the allocated memory we write
@@ -388,6 +406,8 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
             if (encoding) sprintf(headers+strlen(headers), "Content-Encoding: %s\r\n", encoding); // write the encoding header if it was encoded
             sprintf(headers+strlen(headers), "Content-Length: %lu\r\nContent-Type: %s\r\n\r\n", content_length, content_type);
 
+            cached->header_length = strlen(headers);
+
             char* buffer = malloc(strlen(headers)+content_length+1);
             strcpy(buffer, headers);
             
@@ -410,12 +430,15 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
             cached->length = length+content_length+1;
         }
 
-        printf("Response: %s\n", cached->response);
+        int send_head = !strcasecmp(request->method, "HEAD");
+        int len = (int) (send_head ? cached->header_length : cached->length);
+
+        // printf("Response: %s\n", cached->response);
         if (client->tls) {
-            SSL_write(client->ssl, out ? out : cached->response, cached->length);
+            SSL_write(client->ssl, out ? out : cached->response, len);
         }
         else {
-            send(client->socket, out ? out : cached->response, cached->length, 0);
+            send(client->socket, out ? out : cached->response, len, 0);
         }
         if (out) free(out);
 
@@ -427,13 +450,15 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         free(request->path);
         free(request->method);
         free(request);
-        printf("Child done with request\n");
+        free(full_path);
+        // printf("Child done with request\n");
         exit(0);
     }
     else {
         // sockets might be preserved if the parent process doesn't close it
         // this causes problems in older browsers
         // modern browsers will automatically close it i think
+        free(full_path);
         drop_client(client);
         return 1;
     }
@@ -499,38 +524,47 @@ struct parsed_request* parse_request(struct client_info* client, char* http_requ
 
     char* original = http_request;
     int space = strcspn(http_request, " \r\n"); // get the number of characters to the next space or newline
+    // we check for newline as well to make sure we don't overflow to the next line
     if (space == strlen(http_request)) { // if there isn't any, malformed request
         send_400(client);
         return 0;
-
+    }
+    int nline = strcspn(http_request, "\r\n");
+    if (nline == space) { // if we made it to the end of the line without seeing a space then it's malformed
+        send_400(client);
+        return 0;
     }
     char* method = malloc(space + 1);
     method[space] = '\0'; // terminate method string
     strncpy(method, http_request, space);
 
     http_request += space+1;
-    space = strcspn(http_request, " "); // get the number of characters to the next space
+    space = strcspn(http_request, " \r\n"); // get the number of characters to the next space
     if (space == strlen(http_request)) { // if there isn't one, it's missing the path
+        send_400(client);
+        return 0;
+    }
+    if (nline == space) { // same as before, still on the same line
         send_400(client);
         return 0;
     }
     char* path = malloc(space + 1);
     strncpy(path, http_request, space);
     path[space] = '\0'; // terminate path string
-   // printf("Path: %s\n", path);
 
     http_request += space;
     char* next = strstr(http_request, "\r\n"); // get the next line in the request, we don't care about the second part(it's the http version)
+    // can't use nline for this becaus it could be \r or \n
     if (next) http_request = next+2;
-    if (http_request[0] == '\r' || http_request[0] == '\n' || http_request[0] == ' ') {
+    if (http_request[0] == '\r' || http_request[0] == '\n' || http_request[0] == ' ' || http_request[0] == '\0') {
         // there aren't any headers, this line is immediately followed by an empty line or something
         parsed->headers = 0;
     }
     else {
         parsed->headers = get_headers(http_request);
         
-        char* user_agent = get_header_value(parsed->headers, "User-Agent");
-        /*if (user_agent) printf("User agent: %s\n", user_agent); // debug
+        /*char* user_agent = get_header_value(parsed->headers, "User-Agent");
+        if (user_agent) printf("User agent: %s\n", user_agent); // debug
         else printf("Couldn't find user agent!\n");*/
     }
     
@@ -545,7 +579,7 @@ struct parsed_request* parse_request(struct client_info* client, char* http_requ
 }
 
 void handle_request(struct client_info* client, char* request, char* serve) { // request is null terminated
-    printf("Request %s\n", request);
+    // printf("Request %s\n", request);
     struct parsed_request* parsed = parse_request(client, request);
     if (!parsed) return;
 
@@ -553,7 +587,7 @@ void handle_request(struct client_info* client, char* request, char* serve) { //
         send_400(client);
     }
     else {
-        if (!strcasecmp(parsed->method, "GET")) {
+        if (!strcasecmp(parsed->method, "GET") || !strcasecmp(parsed->method, "HEAD")) {
             if (strchr(parsed->path, ' ')) {
                 send_400(client);
                 return;
@@ -563,9 +597,50 @@ void handle_request(struct client_info* client, char* request, char* serve) { //
                 send_404(client);
             }
         }
+        else if (!strcasecmp(parsed->method, "OPTIONS")) {
+            if (!strcmp(parsed->path, "*")) {
+                char wildcard_options[2048];
+                sprintf(wildcard_options,
+                    "HTTP/1.1 200 OK\r\n"
+                    "Allow: OPTIONS, GET, HEAD\r\n"
+                    "Cache_Control: max-age=%i\r\n"
+                    "Content-Length: 0\r\n\r\n",
+                    CACHE_LIFETIME
+                );
+
+                send_uncached(client, wildcard_options, strlen(wildcard_options));
+            }
+            else {
+                char* filepath = sanitize_file_path(serve, parsed->path, client);
+                if (access(filepath, F_OK) == 0) { // Check if the file path exists
+                    char response[2048];
+                    sprintf(response,
+                        "HTTP/1.1 200 OK\r\n"
+                        "Allow: OPTIONS, GET, HEAD\r\n"
+                        "Cache_Control: max-age=%i\r\n"
+                        "Content-Length: 0\r\n\r\n",
+                        CACHE_LIFETIME
+                    );
+                    send_uncached(client, response, strlen(response));
+                }
+                else {
+                    char response[2048];
+                    sprintf(response,
+                        "HTTP/1.1 404 Not Found\r\n"
+                        "Allow: OPTIONS, GET, HEAD\r\n"
+                        "Cache_Control: max-age=%i\r\n"
+                        "Content-Length: 0\r\n\r\n",
+                        CACHE_LIFETIME
+                    );
+                    send_uncached(client, response, strlen(response));
+                }
+
+                free(filepath);
+            }
+        }
         else {
-            // we are only looking at GET requests right now
-            send_404(client);
+            // we are only looking at GET, HEAD, and OPTIONS requests right now
+            send_501(client);
         }
     }
 
@@ -573,7 +648,7 @@ void handle_request(struct client_info* client, char* request, char* serve) { //
     free(parsed->method);
     free_headers(parsed->headers);
     free(parsed);
-    printf("Served request\n");
+    // printf("Served request\n");
 }
 
 int main(int argc, char* argv[]) {
@@ -648,7 +723,7 @@ int main(int argc, char* argv[]) {
                 drop_client(client);
             }
             else {
-                printf("New https connection from %s, using SSL %s\n", get_client_address(client), SSL_get_cipher(client->ssl));
+                //printf("New https connection from %s, using SSL %s\n", get_client_address(client), SSL_get_cipher(client->ssl));
                 client->tls = 1;
             }
 
@@ -670,7 +745,7 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
 
-            printf("New http connection from %s\n", get_client_address(client));
+            //printf("New http connection from %s\n", get_client_address(client));
 
         }
 
