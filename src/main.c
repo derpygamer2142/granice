@@ -50,6 +50,9 @@ struct cached_response {
     size_t header_length;
 };
 
+// max time since last packet, in seconds
+#define CLIENT_TIMEOUT 8
+
 #define MAX_REQUEST_SIZE 2048
 
 struct client_info {
@@ -61,6 +64,7 @@ struct client_info {
     struct client_info *next;
     SSL* ssl;
     int tls;
+    time_t last_packet;
 };
 
 struct header_list {
@@ -96,6 +100,8 @@ struct client_info* get_client(int socket) {
 
     n->address_length = sizeof(n->address);
     n->next = clients;
+    time(&n->last_packet);
+
     clients = n;
     return n;
 }
@@ -132,6 +138,8 @@ const char* get_client_address(struct client_info* ci) {
     return address_buffer;
 }
 
+struct timeval timeout_struct;
+
 fd_set wait_on_clients(int https, int http) {
     fd_set reads;
     FD_ZERO(&reads);
@@ -147,7 +155,7 @@ fd_set wait_on_clients(int https, int http) {
         ci = ci->next;
     }
 
-    if (select(max_socket+1, &reads, 0, 0, 0) < 0) {
+    if (select(max_socket+1, &reads, 0, 0, &timeout_struct) < 0) {
         fprintf(stderr, "select() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }
@@ -510,7 +518,7 @@ int create_socket(const char* host, const char* port) {
     freeaddrinfo(bind_address);
 
     //printf("Now listening\n");
-    if (listen(socket_listen, 10)) {
+    if (listen(socket_listen, 64)) {
         fprintf(stderr, "listen() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }
@@ -655,7 +663,6 @@ void handle_request(struct client_info* client, char* request, char* serve) { //
 }
 
 int main(int argc, char* argv[]) {
-
     signal(SIGPIPE, SIG_IGN);
 
     char cert_path[128];
@@ -692,6 +699,8 @@ int main(int argc, char* argv[]) {
     int http_server  = create_socket("0.0.0.0", "80");
 
     responseCache = hash_table_init(0);
+
+    timeout_struct.tv_sec = CLIENT_TIMEOUT;
 
     while (1) {
         fd_set reads;
@@ -753,6 +762,8 @@ int main(int argc, char* argv[]) {
         }
 
         struct client_info* client = clients;
+        time_t current;
+        time(&current);
 
         while (client) {
 
@@ -779,7 +790,13 @@ int main(int argc, char* argv[]) {
                     if (q) {
                         handle_request(client, client->request, argv[2]);
                     }
-
+                    client->last_packet = current;
+                }
+            }
+            else {
+                if (current - client->last_packet > CLIENT_TIMEOUT) {
+                    printf("Client timeout %s\n", get_client_address(client));
+                    drop_client(client);
                 }
             }
 
