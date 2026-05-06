@@ -248,6 +248,7 @@ struct header_list* get_headers(char* request) {
 }
 
 void free_headers(struct header_list* headers) {
+    if (!headers) return;
     for (int i = 0; i < headers->length; i++) {
         free(headers->headers[i]);
     }
@@ -257,10 +258,15 @@ void free_headers(struct header_list* headers) {
 
 char* get_header_value(struct header_list* headers, char* header) {
     // search for the value of header in the headers object
-    
+    if (!headers) return 0;
+
     int headerlen = strlen(header);
     for (int i = 0; i < headers->length; i++) {
-        if (!strncasecmp(headers->headers[i], header, headerlen)) return headers->headers[i]+headerlen+2;
+        int actual = strlen(headers->headers[i]);
+        if (!strncasecmp(headers->headers[i], header, headerlen)) {
+            if (actual >= headerlen+2) return headers->headers[i]+headerlen+2;
+            return 0;
+        }
     }
 
     return 0;
@@ -538,11 +544,13 @@ struct parsed_request* parse_request(struct client_info* client, char* http_requ
     // we check for newline as well to make sure we don't overflow to the next line
     if (space == strlen(http_request)) { // if there isn't any, malformed request
         send_400(client);
+        free(parsed);
         return 0;
     }
     int nline = strcspn(http_request, "\r\n");
     if (nline == space) { // if we made it to the end of the line without seeing a space then it's malformed
         send_400(client);
+        free(parsed);
         return 0;
     }
     char* method = malloc(space + 1);
@@ -551,12 +559,17 @@ struct parsed_request* parse_request(struct client_info* client, char* http_requ
 
     http_request += space+1;
     space = strcspn(http_request, " \r\n"); // get the number of characters to the next space
+    nline = strstr(http_request, "\r\n")-http_request;
     if (space == strlen(http_request)) { // if there isn't one, it's missing the path
         send_400(client);
+        free(method);
+        free(parsed);
         return 0;
     }
     if (nline == space) { // same as before, still on the same line
         send_400(client);
+        free(method);
+        free(parsed);
         return 0;
     }
     char* path = malloc(space + 1);
@@ -787,10 +800,10 @@ int main(int argc, char* argv[]) {
                     client->received += r;
                     client->request[client->received] = 0;
                     char* q = strstr(client->request, "\r\n\r\n"); // todo: close socket if client doesn't end request, handle post body?
+                    if (client) client->last_packet = current;
                     if (q) {
                         handle_request(client, client->request, argv[2]);
                     }
-                    client->last_packet = current;
                 }
             }
             else {
