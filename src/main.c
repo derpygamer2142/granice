@@ -229,7 +229,7 @@ struct header_list* get_headers(char* request) {
     int i = 0;
     while (i < MAX_HEADERS) {
         char* next = strstr(request, "\r\n");
-        if (next == request) { 
+        if (next == request || i == MAX_HEADERS-1) { 
             struct header_list* retobj = calloc(1, sizeof(struct header_list));
             retobj->headers = headers;
             retobj->length = i;
