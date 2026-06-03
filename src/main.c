@@ -700,6 +700,7 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "SSL_CTX_new() failed\n");
         return 1;
     }
+    SSL_CTX_set_options(ctx, SSL_OP_IGNORE_UNEXPECTED_EOF); // Fixes a thing where unexpected SSL disconnects cause problems
     if (!SSL_CTX_use_certificate_file(ctx, cert_path, SSL_FILETYPE_PEM)
     || !SSL_CTX_use_PrivateKey_file(ctx, key_path, SSL_FILETYPE_PEM)) {
         fprintf(stderr, "SSL_CTX_use_certificate_file() failed\n");
