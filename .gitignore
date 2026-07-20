@@ -2,3 +2,5 @@ public/
 private/
 test/*
 *.bin
+test.txt
+build/*
