@@ -19,6 +19,12 @@ struct client_info* get_client(int socket) {
         exit(1);
     }
 
+    n->last_packet = 0;
+    n->received = 0;
+    n->socket = 0;
+    n->ssl = 0;
+    n->tls = 0;
+
     n->address_length = sizeof(n->address);
     n->next = clients;
     time(&n->last_packet);
@@ -28,9 +34,17 @@ struct client_info* get_client(int socket) {
 }
 
 void drop_client(struct client_info* client) {
-    close(client->socket);
-    SSL_shutdown(client->ssl);
-    SSL_free(client->ssl);
+    if (client->socket) {
+        close(client->socket);
+        client->socket = 0;
+    }
+    if (client->ssl) {
+        SSL_shutdown(client->ssl);
+        SSL_free(client->ssl);
+        
+        client->ssl = 0;
+        printf("Warning - drop_client called after free");
+    }
     
 
     struct client_info** p = &clients;
@@ -43,9 +57,6 @@ void drop_client(struct client_info* client) {
         }
         p = &(*p)->next;
     }
-
-    fprintf(stderr, "drop_client not found\n");
-    exit(1);
 }
 
 const char* get_client_address(struct client_info* ci) {

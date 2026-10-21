@@ -433,6 +433,7 @@ int main(int argc, char* argv[]) {
             // handle connections on the http port
             struct client_info* client = get_client(-1);
             client->tls = 0;
+            client->ssl = 0;
 
             client->socket = accept(http_server,
                 (struct sockaddr*) &(client->address),
