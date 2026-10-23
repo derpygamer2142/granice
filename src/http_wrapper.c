@@ -1,6 +1,7 @@
 #include "http_wrapper.h"
 
 void send_400(struct client_info* client) {
+    if (!client->ssl && !client->socket) return; // If the socket was destroyed, don't try to send anything.
     // printf("sent 400\n");
     const char* text = "HTTP/1.1 400 Bad Request\r\n"
                        "Connection: close\r\n"
@@ -11,6 +12,7 @@ void send_400(struct client_info* client) {
 }
 
 void send_404(struct client_info* client) {
+    if (!client->ssl && !client->socket) return; // If the socket was destroyed, don't try to send anything.
     // printf("sent 404\n");
     const char* text = "HTTP/1.1 404 Not Found\r\n"
                        "Connection: close\r\n"
@@ -21,6 +23,7 @@ void send_404(struct client_info* client) {
 }
 
 void send_501(struct client_info* client) {
+    if (!client->ssl && !client->socket) return; // If the socket was destroyed, don't try to send anything.
     // printf("sent 501\n");
     const char* text = "HTTP/1.1 501 Not Implemented\r\n"
                        "Connection: close\r\n"
@@ -31,6 +34,7 @@ void send_501(struct client_info* client) {
 }
 
 void send_uncached(struct client_info* client, char* response, int length) {
+    if (!client->ssl && !client->socket) return; // If the socket was destroyed, don't try to send anything.
     if (client->tls) SSL_write(client->ssl, response, length); // todo: queue this?
     else send(client->socket, response, length, 0);
     drop_client(client);

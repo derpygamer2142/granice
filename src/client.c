@@ -41,9 +41,10 @@ void drop_client(struct client_info* client) {
     if (client->ssl) {
         SSL_shutdown(client->ssl);
         SSL_free(client->ssl);
-        
+
         client->ssl = 0;
-        printf("Warning - drop_client called after free");
+        
+        printf("Warning - drop_client called after free\n");
     }
     
 

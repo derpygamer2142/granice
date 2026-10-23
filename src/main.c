@@ -198,10 +198,10 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         int len = (int) (send_head ? cached->header_length : cached->length);
 
         // printf("Response: %s\n", cached->response);
-        if (client->tls) {
+        if (client->tls && client->ssl) {
             SSL_write(client->ssl, out ? out : cached->response, len);
         }
-        else {
+        else if (client->socket) {
             send(client->socket, out ? out : cached->response, len, 0);
         }
         if (out) free(out);
@@ -271,7 +271,7 @@ int create_socket(const char* host, const char* port) {
     freeaddrinfo(bind_address);
 
     //printf("Now listening\n");
-    if (listen(socket_listen, 64)) {
+    if (listen(socket_listen, 256)) {
         fprintf(stderr, "listen() failed. %s (%d)\n", strerror(errno), errno);
         exit(1);
     }
