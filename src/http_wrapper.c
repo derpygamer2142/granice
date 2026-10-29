@@ -154,6 +154,7 @@ struct parsed_request* parse_request(struct client_info* client, char* http_requ
         fprintf(stderr, "Out of memory.\n");
         exit(1);
     }
+    timespec_get(&parsed->startTime, TIME_UTC);
 
     char* original = http_request;
     int space = strcspn(http_request, " \r\n"); // get the number of characters to the next space or newline

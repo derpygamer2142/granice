@@ -2,6 +2,7 @@
 #define HTTP_WRAPPER
 #include "client.h"
 #include <stdlib.h>
+#include <time.h>
 
 struct header_list {
     char** headers;
@@ -13,6 +14,7 @@ struct parsed_request {
     char* method;
     char* body;
     struct header_list* headers;
+    struct timespec startTime;
 };
 
 void send_400(struct client_info* client);

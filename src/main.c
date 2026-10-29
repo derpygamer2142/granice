@@ -34,6 +34,9 @@ const unsigned int NUM_ACCEPTED_ENCODINGS = 1;
 #include "client.h"
 #include "http_wrapper.h"
 
+// how much nonsense to flood your terminal with
+#define VERBOSITY 1
+
 // completely arbitrary
 #define CACHE_KEY_LENGTH 128
 // in seconds
@@ -121,6 +124,8 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         // the content length and the main thread will reallocate the memory.
         entry->response = (char*) malloc_shm(CACHE_REQUEST_ALLOC);
 
+        if (VERBOSITY == 1) printf("Cache miss - Created entry %x\n", SuperFastHash(key, strlen(key)));
+
         hash_store(responseCache, key, strlen(key), (void*) entry);
 
         cached = entry; // make it easier for the child thread to edit the entry
@@ -140,6 +145,7 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         char* out = 0;
 
         if (timer - cached->last_update >= CACHE_LIFETIME) {
+            if (VERBOSITY == 1) printf("Cache miss - Updated entry\n");
             // cache is expired, update
 
             fseek(fp, 0L, SEEK_END);
@@ -154,7 +160,10 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
 
             if (accepted_encoding) {
                 if (strstr(accepted_encoding, "gzip")) {
+                    double lengthOld = (double)content_length;
                     char* compressed = zlibGzip(filedata, content_length, &content_length);
+
+                    if (VERBOSITY == 1) printf("Compressed body from %0.0lf to %ld bytes (-%0.3lf%%)\n", lengthOld, content_length, 100.0*(lengthOld-(double)content_length)/lengthOld);
                     free(filedata);
                     filedata = compressed;
                     encoding = "gzip";
@@ -193,6 +202,9 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
 
             cached->length = length+content_length+1;
         }
+        else {
+            if (VERBOSITY == 1) printf("Cache hit - %ld seconds old\n", timer - cached->last_update);
+        }
 
         int send_head = !strcasecmp(request->method, "HEAD");
         int len = (int) (send_head ? cached->header_length : cached->length);
@@ -204,6 +216,20 @@ int serve_directory(char* directory, struct client_info* client, char* path, str
         else if (client->socket) {
             send(client->socket, out ? out : cached->response, len, 0);
         }
+
+        
+        if (VERBOSITY == 1) {
+            struct timespec highres;
+            timespec_get(&highres, TIME_UTC);
+            highres.tv_nsec -= request->startTime.tv_nsec;
+            if (highres.tv_nsec < 0) {
+                highres.tv_nsec += 999999999+1; // From cppreference.com
+                highres.tv_sec  -= 1;
+            }
+            double diff = (double)(highres.tv_sec-request->startTime.tv_sec) + (double)(highres.tv_nsec)/(999999999.0+1.0);
+            printf("Sent %d bytes in %lf seconds\n", len, diff);
+        }
+
         if (out) free(out);
 
         // free(buffer);
@@ -282,6 +308,8 @@ int create_socket(const char* host, const char* port) {
 void handle_request(struct client_info* client, char* request, char* serve) { // request is null terminated
     struct parsed_request* parsed = parse_request(client, request);
     if (!parsed) return;
+
+    printf("Received request with method %s\n", parsed->method);
 
     if (strncmp("/", parsed->path, 1)) { // not a path
         send_400(client);
