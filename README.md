@@ -1,5 +1,6 @@
 # Granice
 
+This project has a corresponding page on [my website](https://derpygamer2142.com/projects/granice).
 Weird C web server, almost certainly super insecure so don't use this for anything important. Might become more user friendly eventually.
 
 ## Features
