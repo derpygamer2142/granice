@@ -58,6 +58,7 @@ const char* get_content_type(const char* path) {
         if (strcmp(last_dot, ".svg") == 0) return "image/svg+xml";
         if (strcmp(last_dot, ".txt") == 0) return "text/plain";
         if (strcmp(last_dot, ".md") == 0) return "text/markdown";
+        if (strcmp(last_dot, ".mp4") == 0) return "video/mp4";
     }
 
     return "application/octet-stream";
